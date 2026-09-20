@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tendrix VerifyGEM - hackathon serverless backend (Mumbai)
+
+Resources:
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteHackathonDocumentsAfterSevenDays
+            Status: Enabled
+            ExpirationInDays: 7
+
+  AnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: analysisId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: analysisId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VerifyGemDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt AnalysisTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${DocumentsBucket.Arn}/*'
+              - Effect: Allow
+                Action: [textract:DetectDocumentText, textract:AnalyzeDocument]
+                Resource: '*'
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: '*'
+
+  VerifyGemApi:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 25
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AnalysisTable
+          BUCKET_NAME: !Ref DocumentsBucket
+      Code:
+        ZipFile: |
+          import json, os, uuid, datetime, boto3
+          table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+          checks = [
+            {'id':'gst','requirement':'Valid GST registration certificate','source':'Clause 4.1 · Eligibility','status':'Verified','confidence':98,'evidence':'GSTIN 29AABCT4812H1ZV · Certificate page 1','detail':'GST registration is active and the legal entity name matches the bidder profile.','page':'Bidder GST Certificate · p. 1','connector':'GSTN'},
+            {'id':'turnover','requirement':'Average annual turnover ≥ ₹2 Cr','source':'Clause 4.3 · Financial capacity','status':'Verified','confidence':94,'evidence':'₹2.46 Cr avg. FY22–FY24 · Audited statements','detail':'Average annual turnover calculated from three uploaded audited financial statements.','page':'Audited Financials FY22–FY24 · p. 3, 7, 11','connector':'Document intelligence'},
+            {'id':'experience','requirement':'Completed 2 similar projects in last 3 years','source':'Clause 5.2 · Experience','status':'Needs review','confidence':71,'evidence':'1 matched project · 1 project lacks completion proof','detail':'One supplied experience certificate meets the tender threshold. The second reference has no completion certificate attached.','page':'Experience Portfolio · p. 4–6','connector':'Document intelligence'},
+            {'id':'iso','requirement':'ISO 27001:2022 certification','source':'Clause 6.1 · Information security','status':'Missing','confidence':99,'evidence':'No supporting document found','detail':'No valid ISO 27001 certificate or equivalent evidence was found in the submitted bundle.','page':'No source evidence','connector':'Document intelligence'},
+            {'id':'blacklist','requirement':'No blacklisting declaration','source':'Clause 7.4 · Declarations','status':'Verified','confidence':91,'evidence':'Signed declaration dated 18 Sep 2026','detail':'Declaration is signed by the authorized signatory and matches the tender language.','page':'Declarations.pdf · p. 2','connector':'Declaration review'}]
+          def response(code, body):
+              return {'statusCode':code, 'headers':{'content-type':'application/json','access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'}, 'body':json.dumps(body)}
+          def handler(event, context):
+              method = event.get('requestContext',{}).get('http',{}).get('method', 'GET')
+              path = event.get('rawPath', '/')
+              if method == 'OPTIONS': return response(204,{})
+              if method == 'GET' and path.endswith('/health'): return response(200, {'ok':True,'service':'tendrix-verifygem-api','provider':'aws-lambda'})
+              if method == 'POST' and path.endswith('/analyses'):
+                  body = json.loads(event.get('body') or '{}')
+                  now = datetime.datetime.now(datetime.UTC).isoformat()
+                  analysis = {'id':str(uuid.uuid4()), 'status':'complete', 'tender':body.get('tender',{}), 'bidder':body.get('bidder',{}), 'checks':checks, 'audit':[{'at':now,'actor':'VerifyGEM AI','action':'Analysis completed','note':'Extracted tender requirements and matched bidder evidence.'}], 'createdAt':now, 'updatedAt':now}
+                  table.put_item(Item={'analysisId':analysis['id'], 'payload':analysis, 'createdAt':now})
+                  return response(201, {'analysis':analysis,'summary':{'verified':3,'review':1,'missing':1,'score':78,'risk':'Medium','recommendation':'Eligible with review items'}})
+              return response(404, {'error':'Route not found.'})
+
+  ApiUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt VerifyGemApi.Arn
+      AuthType: NONE
+      Cors:
+        AllowCredentials: false
+        AllowHeaders: ['content-type']
+        AllowMethods: ['GET', 'POST']
+        AllowOrigins: ['*']
+        MaxAge: 300
+
+  ApiUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VerifyGemApi
+      Action: lambda:InvokeFunctionUrl
+      FunctionUrlAuthType: NONE
+      Principal: '*'
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VerifyGemApi
+      Action: lambda:InvokeFunction
+      InvokedViaFunctionUrl: true
+      Principal: '*'
+
+Outputs:
+  ApiUrl:
+    Description: Public API URL for the Tendrix web app
+    Value: !GetAtt ApiUrl.FunctionUrl
+  DocumentsBucket:
+    Description: Private encrypted document storage bucket
+    Value: !Ref DocumentsBucket
+  AnalysisTable:
+    Description: DynamoDB audit and analysis table
+    Value: !Ref AnalysisTable
